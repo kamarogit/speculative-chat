@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Speculative Chat</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: system-ui, sans-serif; background: #0f0f0f; color: #e0e0e0; height: 100dvh; display: flex; flex-direction: column; }
+
+  #messages { flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 12px; }
+
+  .msg { max-width: 75%; padding: 10px 14px; border-radius: 12px; line-height: 1.5; white-space: pre-wrap; word-break: break-word; }
+  .msg.user { background: #1a6cf6; align-self: flex-end; }
+  .msg.assistant { background: #1e1e1e; align-self: flex-start; border: 1px solid #333; }
+  .msg.assistant.cache-hit { border-color: #2a7a2a; }
+
+  .msg-meta { font-size: 11px; margin-top: 6px; display: flex; flex-direction: column; gap: 4px; }
+  .badge-hit { color: #4a4; }
+  .badge-predicted { color: #888; font-style: italic; }
+  .real-loading { color: #4a9eff; }
+  .switch-btn {
+    margin-top: 4px; padding: 3px 10px; font-size: 11px;
+    background: #1a3a5c; border: 1px solid #4a9eff; border-radius: 6px;
+    color: #4a9eff; cursor: pointer; align-self: flex-start;
+  }
+  .switch-btn:hover { background: #1e4a70; }
+
+  #status-bar {
+    font-size: 11px; padding: 4px 16px; color: #555; min-height: 20px;
+    display: flex; align-items: center; gap: 6px;
+  }
+  #status-bar .dot { width: 6px; height: 6px; border-radius: 50%; background: #555; }
+  #status-bar.predicting .dot { background: #a070f0; animation: pulse 1.2s infinite; }
+  #status-bar.speculating .dot { background: #f0a020; animation: pulse 1s infinite; }
+  #status-bar.thinking .dot { background: #4a9eff; animation: pulse 0.6s infinite; }
+  #status-bar.hit .dot { background: #2a7a2a; }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.3} }
+
+  #input-area { display: flex; gap: 8px; padding: 12px 16px; border-top: 1px solid #222; }
+  #input { flex: 1; background: #1a1a1a; border: 1px solid #333; border-radius: 8px; padding: 10px 14px; color: #e0e0e0; font-size: 15px; resize: none; outline: none; height: 44px; max-height: 120px; overflow-y: auto; }
+  #input:focus { border-color: #555; }
+  #send-btn { background: #1a6cf6; border: none; border-radius: 8px; padding: 10px 18px; color: #fff; font-size: 15px; cursor: pointer; }
+  #send-btn:disabled { opacity: 0.4; cursor: default; }
+</style>
+</head>
+<body>
+
+<div id="messages"></div>
+<div id="status-bar"><div class="dot"></div><span id="status-text"></span></div>
+<div id="input-area">
+  <textarea id="input" placeholder="メッセージを入力..." rows="1"></textarea>
+  <button id="send-btn">送信</button>
+</div>
+
+<script>
+const ws = new WebSocket(`ws://${location.host}/ws`);
+const messages = document.getElementById('messages');
+const input = document.getElementById('input');
+const sendBtn = document.getElementById('send-btn');
+const statusBar = document.getElementById('status-bar');
+const statusText = document.getElementById('status-text');
+
+let lastAssistantMsg = null; // 直近の投機ヒットメッセージ（切替用）
+
+function setStatus(state, text) {
+  statusBar.className = state;
+  statusText.textContent = text;
+}
+
+function addMsg(role, text) {
+  const div = document.createElement('div');
+  div.className = `msg ${role}`;
+  div.textContent = text;
+  messages.appendChild(div);
+  messages.scrollTop = messages.scrollHeight;
+  return div;
+}
+
+function addSpeculativeMsg(specText, specQuery) {
+  const div = document.createElement('div');
+  div.className = 'msg assistant cache-hit';
+
+  const body = document.createElement('div');
+  body.className = 'msg-body';
+  body.textContent = specText;
+
+  const meta = document.createElement('div');
+  meta.className = 'msg-meta';
+
+  const badgeHit = document.createElement('div');
+  badgeHit.className = 'badge-hit';
+  badgeHit.textContent = '⚡ 投機実行ヒット';
+
+  const badgePred = document.createElement('div');
+  badgePred.className = 'badge-predicted';
+  badgePred.textContent = `予測プロンプト: "${specQuery}"`;
+
+  const realLoading = document.createElement('div');
+  realLoading.className = 'real-loading';
+  realLoading.textContent = '本物の回答を生成中...';
+
+  meta.appendChild(badgeHit);
+  meta.appendChild(badgePred);
+  meta.appendChild(realLoading);
+  div.appendChild(body);
+  div.appendChild(meta);
+  messages.appendChild(div);
+  messages.scrollTop = messages.scrollHeight;
+
+  return { div, body, meta, realLoading, specText };
+}
+
+ws.onmessage = (e) => {
+  const data = JSON.parse(e.data);
+
+  if (data.type === 'predicting') {
+    setStatus('predicting', `プロンプト予測中…`);
+  } else if (data.type === 'speculating') {
+    setStatus('speculating', `投機実行中… "${data.query.slice(0, 30)}"`);
+  } else if (data.type === 'speculative_done') {
+    setStatus('hit', '投機実行完了（送信待ち）');
+  } else if (data.type === 'speculative_error') {
+    setStatus('', '');
+  } else if (data.type === 'thinking') {
+    setStatus('thinking', '生成中…');
+    sendBtn.disabled = true;
+  } else if (data.type === 'response') {
+    if (data.cache_hit) {
+      lastAssistantMsg = addSpeculativeMsg(data.text, data.speculative_query);
+      setStatus('', '');
+      // 本物の回答生成中なので送信は一時的にOK（本物が来るまで）
+    } else {
+      addMsg('assistant', data.text);
+      setStatus('', '');
+      sendBtn.disabled = false;
+      lastAssistantMsg = null;
+    }
+  } else if (data.type === 'real_response') {
+    if (lastAssistantMsg) {
+      const { div, body, meta, realLoading, specText } = lastAssistantMsg;
+      realLoading.remove();
+
+      const switchBtn = document.createElement('button');
+      switchBtn.className = 'switch-btn';
+      switchBtn.textContent = '↔ 実際の回答に切替';
+
+      let showingSpec = true;
+      switchBtn.addEventListener('click', () => {
+        showingSpec = !showingSpec;
+        body.textContent = showingSpec ? specText : data.text;
+        switchBtn.textContent = showingSpec ? '↔ 実際の回答に切替' : '↔ 投機回答に戻す';
+        div.classList.toggle('cache-hit', showingSpec);
+      });
+
+      meta.appendChild(switchBtn);
+      messages.scrollTop = messages.scrollHeight;
+      lastAssistantMsg = null;
+    }
+  } else if (data.type === 'real_error') {
+    if (lastAssistantMsg) {
+      const { realLoading } = lastAssistantMsg;
+      realLoading.textContent = `本物の回答エラー: ${data.error}`;
+      realLoading.style.color = '#c44';
+      lastAssistantMsg = null;
+    }
+  } else if (data.type === 'error') {
+    addMsg('assistant', `[ERROR] ${data.error}`);
+    sendBtn.disabled = false;
+    setStatus('', '');
+    lastAssistantMsg = null;
+  }
+};
+
+input.addEventListener('input', () => {
+  ws.send(JSON.stringify({ type: 'input', text: input.value }));
+  input.style.height = 'auto';
+  input.style.height = Math.min(input.scrollHeight, 120) + 'px';
+});
+
+function submit() {
+  const text = input.value.trim();
+  if (!text || sendBtn.disabled) return;
+  addMsg('user', text);
+  ws.send(JSON.stringify({ type: 'submit', text }));
+  input.value = '';
+  input.style.height = '44px';
+  ws.send(JSON.stringify({ type: 'clear' }));
+  setStatus('', '');
+}
+
+sendBtn.addEventListener('click', submit);
+input.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); submit(); }
+});
+</script>
+</body>
+</html>
