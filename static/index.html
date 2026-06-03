@@ -98,7 +98,6 @@ function addSpeculativeMsg(specText, specQuery) {
 
   const realLoading = document.createElement('div');
   realLoading.className = 'real-loading';
-  realLoading.textContent = '本物の回答を生成中...';
 
   meta.appendChild(badgeHit);
   meta.appendChild(badgePred);
@@ -138,30 +137,36 @@ ws.onmessage = (e) => {
     }
   } else if (data.type === 'real_response') {
     if (lastAssistantMsg) {
-      const { div, body, meta, realLoading, specText } = lastAssistantMsg;
+      const { meta, realLoading, specText } = lastAssistantMsg;
       realLoading.remove();
 
-      const switchBtn = document.createElement('button');
-      switchBtn.className = 'switch-btn';
-      switchBtn.textContent = '↔ 実際の回答に切替';
+      if (!data.hit) {
+        // 予測外れ → 切替ボタンを出す
+        const body = lastAssistantMsg.div.querySelector('.msg-body');
+        const realText = data.text;
+        const switchBtn = document.createElement('button');
+        switchBtn.className = 'switch-btn';
+        switchBtn.textContent = '⚠ 予測外れ: 実際の回答を見る';
 
-      let showingSpec = true;
-      switchBtn.addEventListener('click', () => {
-        showingSpec = !showingSpec;
-        body.textContent = showingSpec ? specText : data.text;
-        switchBtn.textContent = showingSpec ? '↔ 実際の回答に切替' : '↔ 投機回答に戻す';
-        div.classList.toggle('cache-hit', showingSpec);
-      });
+        let showingSpec = true;
+        switchBtn.addEventListener('click', () => {
+          showingSpec = !showingSpec;
+          const canonical = showingSpec ? specText : realText;
+          body.textContent = canonical;
+          switchBtn.textContent = showingSpec ? '⚠ 予測外れ: 実際の回答を見る' : '↩ 投機回答に戻す';
+          ws.send(JSON.stringify({ type: 'canon', text: canonical }));
+        });
 
-      meta.appendChild(switchBtn);
-      messages.scrollTop = messages.scrollHeight;
+        meta.appendChild(switchBtn);
+        messages.scrollTop = messages.scrollHeight;
+      }
+      // 予測当たり → 何もしない（ボタン出さない）
       lastAssistantMsg = null;
     }
   } else if (data.type === 'real_error') {
     if (lastAssistantMsg) {
       const { realLoading } = lastAssistantMsg;
-      realLoading.textContent = `本物の回答エラー: ${data.error}`;
-      realLoading.style.color = '#c44';
+      realLoading.textContent = ``;
       lastAssistantMsg = null;
     }
   } else if (data.type === 'error') {

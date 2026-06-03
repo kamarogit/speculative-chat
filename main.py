@@ -1,5 +1,7 @@
 import asyncio
+import difflib
 import os
+import re
 from contextlib import asynccontextmanager
 
 import httpx
@@ -15,7 +17,7 @@ STABLE_THRESHOLD = 2
 PREDICT_DEBOUNCE = 0.4
 
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://192.168.100.106:11434")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3-vl:2b")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3:1.7b")
 
 
 @asynccontextmanager
@@ -27,17 +29,18 @@ app = FastAPI(lifespan=lifespan)
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
 
-async def call_main_llm(query: str) -> str:
+async def call_main_llm(query: str, history: list[dict] | None = None) -> str:
     api_key = os.getenv("OPENROUTER_API_KEY") or os.getenv("ANTHROPIC_API_KEY")
     if not api_key:
         return "[ERROR] API key not set in .env"
+    messages = list(history or []) + [{"role": "user", "content": query}]
     async with httpx.AsyncClient(timeout=60) as client:
         r = await client.post(
             "https://openrouter.ai/api/v1/chat/completions",
             headers={"Authorization": f"Bearer {api_key}"},
             json={
                 "model": os.getenv("LLM_MODEL", "anthropic/claude-3.5-haiku"),
-                "messages": [{"role": "user", "content": query}],
+                "messages": messages,
             },
         )
         r.raise_for_status()
@@ -59,6 +62,12 @@ PREDICT_SYSTEM = """あなたはユーザーの入力途中の文章を、最も
 出力: 富士山の標高は何メートルですか？"""
 
 
+def is_prediction_hit(spec_query: str, actual_query: str, threshold: float = 0.75) -> bool:
+    ratio = difflib.SequenceMatcher(None, spec_query, actual_query).ratio()
+    print(f"[EVAL] similarity={ratio:.2f} spec={spec_query[:30]!r} actual={actual_query[:30]!r}")
+    return ratio >= threshold
+
+
 async def predict_completion(partial: str) -> str:
     async with httpx.AsyncClient(timeout=15) as client:
         r = await client.post(
@@ -77,9 +86,7 @@ async def predict_completion(partial: str) -> str:
         r.raise_for_status()
         content = r.json()["message"]["content"].strip()
         if "<think>" in content:
-            import re
             content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
-        # "出力: " のような prefix が付いた場合に除去
         for prefix in ("出力:", "出力：", "完成形:", "完成形："):
             if content.startswith(prefix):
                 content = content[len(prefix):].strip()
@@ -89,6 +96,7 @@ async def predict_completion(partial: str) -> str:
 class SpeculativeSession:
     def __init__(self):
         self.current_input = ""
+        self.history: list[dict] = []
         self.predict_task: asyncio.Task | None = None
         self.last_prediction: str = ""
         self.stable_count: int = 0
@@ -96,6 +104,16 @@ class SpeculativeSession:
         self.speculative_query: str = ""
         self.speculative_result: str | None = None
         self.real_task: asyncio.Task | None = None
+
+    def add_to_history(self, user: str, assistant: str):
+        self.history.append({"role": "user", "content": user})
+        self.history.append({"role": "assistant", "content": assistant})
+
+    def swap_last_assistant(self, text: str):
+        for i in range(len(self.history) - 1, -1, -1):
+            if self.history[i]["role"] == "assistant":
+                self.history[i]["content"] = text
+                break
 
     def cancel_predict(self):
         if self.predict_task and not self.predict_task.done():
@@ -127,13 +145,13 @@ async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     session = SpeculativeSession()
 
-    async def run_speculation(query: str):
+    async def run_speculation(query: str, history: list[dict]):
         session.speculative_query = query
         session.speculative_result = None
         await websocket.send_json({"type": "speculating", "query": query})
         print(f"[SPEC] start: {query[:40]!r}")
         try:
-            result = await call_main_llm(query)
+            result = await call_main_llm(query, history)
             session.speculative_result = result
             print(f"[SPEC] done: {len(result)} chars")
             await websocket.send_json({"type": "speculative_done", "query": query})
@@ -164,7 +182,9 @@ async def websocket_endpoint(websocket: WebSocket):
                         and session.speculative_query == prediction
                     )
                     if not spec_running and not already_have:
-                        session.speculative_task = asyncio.create_task(run_speculation(prediction))
+                        session.speculative_task = asyncio.create_task(
+                            run_speculation(prediction, list(session.history))
+                        )
             else:
                 session.last_prediction = prediction
                 session.stable_count = 1
@@ -174,12 +194,17 @@ async def websocket_endpoint(websocket: WebSocket):
         except Exception as e:
             print(f"[PRED] error: {e}")
 
-    async def run_real(query: str):
-        print(f"[REAL] start: {query[:40]!r}")
+    async def run_real(actual_query: str, spec_query: str, history: list[dict]):
+        print(f"[REAL] start: {actual_query[:40]!r}")
         try:
-            result = await call_main_llm(query)
+            result = await call_main_llm(actual_query, history)
             print(f"[REAL] done: {len(result)} chars")
-            await websocket.send_json({"type": "real_response", "text": result})
+            hit = is_prediction_hit(spec_query, actual_query)
+            await websocket.send_json({
+                "type": "real_response",
+                "hit": hit,
+                "text": result,
+            })
         except asyncio.CancelledError:
             print("[REAL] cancelled")
         except Exception as e:
@@ -211,6 +236,7 @@ async def websocket_endpoint(websocket: WebSocket):
 
                 spec_result = session.speculative_result
                 spec_query = session.speculative_query
+                history_snapshot = list(session.history)
 
                 if spec_result is not None:
                     await websocket.send_json({
@@ -219,12 +245,16 @@ async def websocket_endpoint(websocket: WebSocket):
                         "speculative_query": spec_query,
                         "cache_hit": True,
                     })
-                    session.real_task = asyncio.create_task(run_real(query))
+                    # 投機結果を履歴に追加（ユーザーが最初に見るのがこちら）
+                    session.add_to_history(query, spec_result)
+                    # 本物のプロンプトでも並行実行（履歴には入れない・比較用）
+                    session.real_task = asyncio.create_task(run_real(query, spec_query, history_snapshot))
                 else:
                     session.cancel_speculation()
                     await websocket.send_json({"type": "thinking"})
                     try:
-                        result = await call_main_llm(query)
+                        result = await call_main_llm(query, session.history)
+                        session.add_to_history(query, result)
                         await websocket.send_json({
                             "type": "response",
                             "text": result,
@@ -236,6 +266,10 @@ async def websocket_endpoint(websocket: WebSocket):
                 session.reset_prediction()
                 session.speculative_result = None
                 session.speculative_query = ""
+
+            elif event == "canon":
+                session.swap_last_assistant(data["text"])
+                print(f"[CANON] history updated: {data['text'][:40]!r}")
 
             elif event == "clear":
                 session.cancel_predict()
