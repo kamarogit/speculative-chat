@@ -1,8 +1,10 @@
 import asyncio
 import difflib
+import json
 import os
 import re
 from contextlib import asynccontextmanager
+from typing import Awaitable, Callable
 
 import httpx
 from dotenv import load_dotenv
@@ -47,39 +49,94 @@ def strip_think(text: str) -> str:
     return text
 
 
-async def call_main_llm_ollama(messages: list[dict]) -> str:
+ChunkHandler = Callable[[str], Awaitable[None]]
+
+
+async def call_main_llm_ollama(
+    messages: list[dict],
+    on_chunk: ChunkHandler | None = None,
+) -> str:
+    payload = {
+        "model": MAIN_OLLAMA_MODEL,
+        "messages": messages,
+        "think": False,
+        "stream": on_chunk is not None,
+    }
     async with httpx.AsyncClient(timeout=180) as client:
-        r = await client.post(
-            f"{MAIN_OLLAMA_BASE_URL}/api/chat",
-            json={
-                "model": MAIN_OLLAMA_MODEL,
-                "messages": messages,
-                "think": False,
-                "stream": False,
-            },
-        )
-        r.raise_for_status()
-        return strip_think(r.json()["message"]["content"])
+        if on_chunk is None:
+            r = await client.post(f"{MAIN_OLLAMA_BASE_URL}/api/chat", json=payload)
+            r.raise_for_status()
+            return strip_think(r.json()["message"]["content"])
+        full = ""
+        async with client.stream("POST", f"{MAIN_OLLAMA_BASE_URL}/api/chat", json=payload) as r:
+            r.raise_for_status()
+            async for line in r.aiter_lines():
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                piece = obj.get("message", {}).get("content", "")
+                if piece:
+                    full += piece
+                    await on_chunk(piece)
+                if obj.get("done"):
+                    break
+        return strip_think(full)
 
 
-async def call_main_llm_openrouter(messages: list[dict]) -> str:
+async def call_main_llm_openrouter(
+    messages: list[dict],
+    on_chunk: ChunkHandler | None = None,
+) -> str:
     if not OPENROUTER_API_KEY:
         return "[ERROR] OPENROUTER_API_KEY not set"
+    payload = {"model": OPENROUTER_MODEL, "messages": messages, "stream": on_chunk is not None}
+    headers = {"Authorization": f"Bearer {OPENROUTER_API_KEY}"}
     async with httpx.AsyncClient(timeout=60) as client:
-        r = await client.post(
+        if on_chunk is None:
+            r = await client.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers=headers,
+                json=payload,
+            )
+            r.raise_for_status()
+            return r.json()["choices"][0]["message"]["content"]
+        full = ""
+        async with client.stream(
+            "POST",
             "https://openrouter.ai/api/v1/chat/completions",
-            headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}"},
-            json={"model": OPENROUTER_MODEL, "messages": messages},
-        )
-        r.raise_for_status()
-        return r.json()["choices"][0]["message"]["content"]
+            headers=headers,
+            json=payload,
+        ) as r:
+            r.raise_for_status()
+            async for line in r.aiter_lines():
+                if not line or not line.startswith("data:"):
+                    continue
+                data = line[5:].strip()
+                if data == "[DONE]":
+                    break
+                try:
+                    obj = json.loads(data)
+                except json.JSONDecodeError:
+                    continue
+                piece = obj["choices"][0].get("delta", {}).get("content", "") or ""
+                if piece:
+                    full += piece
+                    await on_chunk(piece)
+        return full
 
 
-async def call_main_llm(query: str, history: list[dict] | None = None) -> str:
+async def call_main_llm(
+    query: str,
+    history: list[dict] | None = None,
+    on_chunk: ChunkHandler | None = None,
+) -> str:
     messages = list(history or []) + [{"role": "user", "content": query}]
     if MAIN_BACKEND == "openrouter":
-        return await call_main_llm_openrouter(messages)
-    return await call_main_llm_ollama(messages)
+        return await call_main_llm_openrouter(messages, on_chunk)
+    return await call_main_llm_ollama(messages, on_chunk)
 
 
 PREDICT_SYSTEM = """あなたはユーザーの入力途中の文章を、最も自然な完成形に予測補完するアシスタントです。
@@ -270,12 +327,16 @@ async def websocket_endpoint(websocket: WebSocket):
 
     async def run_real(actual_query: str, spec_query: str, history: list[dict]):
         print(f"[REAL] start: {actual_query[:40]!r}")
+        hit = is_prediction_hit(spec_query, actual_query)
+        await websocket.send_json({"type": "real_start", "hit": hit})
         try:
-            result = await call_main_llm(actual_query, history)
+            async def on_chunk(piece: str):
+                await websocket.send_json({"type": "real_chunk", "text": piece})
+
+            result = await call_main_llm(actual_query, history, on_chunk=on_chunk)
             print(f"[REAL] done: {len(result)} chars")
-            hit = is_prediction_hit(spec_query, actual_query)
             await websocket.send_json({
-                "type": "real_response",
+                "type": "real_end",
                 "hit": hit,
                 "text": result,
             })
@@ -332,10 +393,14 @@ async def websocket_endpoint(websocket: WebSocket):
                 else:
                     await websocket.send_json({"type": "thinking"})
                     try:
-                        result = await call_main_llm(query, session.history)
+                        async def on_response_chunk(piece: str):
+                            await websocket.send_json({"type": "response_chunk", "text": piece})
+
+                        await websocket.send_json({"type": "response_start", "cache_hit": False})
+                        result = await call_main_llm(query, session.history, on_chunk=on_response_chunk)
                         session.add_to_history(query, result)
                         await websocket.send_json({
-                            "type": "response",
+                            "type": "response_end",
                             "text": result,
                             "cache_hit": False,
                         })
