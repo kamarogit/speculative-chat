@@ -1,6 +1,6 @@
 import asyncio
 import difflib
-import json
+import math
 import os
 import re
 from contextlib import asynccontextmanager
@@ -18,9 +18,10 @@ PREDICT_MIN_LENGTH = 10
 STABLE_THRESHOLD = 1
 PREDICT_DEBOUNCE = 0.4
 MAX_SPEC_CANDIDATES = 4
-HIT_SIMILARITY_THRESHOLD = 0.75
-STABLE_SIMILARITY = 0.50          # 前回予測との類似度がこれ以上ならstable累積
-CANDIDATE_DEDUP_SIMILARITY = 0.92 # 既存候補とこれ以上似てたら新候補化スキップ
+HIT_SIMILARITY_THRESHOLD = 0.75   # difflibフォールバック用
+HIT_VECTOR_THRESHOLD = 0.75       # bge-m3 cosine類似度しきい値
+STABLE_SIMILARITY = 0.50          # 前回予測との類似度がこれ以上ならstable累積（difflib・頻繁）
+CANDIDATE_DEDUP_SIMILARITY = 0.92 # 既存候補とこれ以上似てたら新候補化スキップ（difflib・頻繁）
 
 MAIN_BACKEND = os.getenv("MAIN_BACKEND", "ollama").lower()  # "ollama" | "openrouter"
 
@@ -32,6 +33,9 @@ OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL") or os.getenv("LLM_MODEL", "anth
 
 PREDICT_OLLAMA_BASE_URL = os.getenv("PREDICT_OLLAMA_BASE_URL", "http://192.168.100.113:11434")
 PREDICT_OLLAMA_MODEL = os.getenv("PREDICT_OLLAMA_MODEL", "Qwen3:1.7b")
+
+EMBED_OLLAMA_BASE_URL = os.getenv("EMBED_OLLAMA_BASE_URL", MAIN_OLLAMA_BASE_URL)
+EMBED_MODEL = os.getenv("EMBED_MODEL", "bge-m3:latest")
 
 
 @asynccontextmanager
@@ -158,10 +162,49 @@ def similarity(a: str, b: str) -> float:
     return difflib.SequenceMatcher(None, a, b).ratio()
 
 
-def is_prediction_hit(spec_query: str, actual_query: str, threshold: float = HIT_SIMILARITY_THRESHOLD) -> bool:
+async def embed(text: str) -> list[float] | None:
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.post(
+                f"{EMBED_OLLAMA_BASE_URL}/api/embed",
+                json={"model": EMBED_MODEL, "input": text},
+            )
+            r.raise_for_status()
+            data = r.json()
+            embs = data.get("embeddings") or []
+            return embs[0] if embs else None
+    except Exception as e:
+        print(f"[EMBED] error: {e}")
+        return None
+
+
+def cosine(a: list[float] | None, b: list[float] | None) -> float | None:
+    if not a or not b or len(a) != len(b):
+        return None
+    dot = sum(x * y for x, y in zip(a, b))
+    na = math.sqrt(sum(x * x for x in a))
+    nb = math.sqrt(sum(x * x for x in b))
+    if na == 0 or nb == 0:
+        return None
+    return dot / (na * nb)
+
+
+async def is_prediction_hit(
+    spec_query: str,
+    spec_emb: list[float] | None,
+    actual_query: str,
+    actual_emb: list[float] | None = None,
+) -> bool:
+    if actual_emb is None:
+        actual_emb = await embed(actual_query)
+    sim_vec = cosine(spec_emb, actual_emb)
+    if sim_vec is not None:
+        print(f"[EVAL-vec] cos={sim_vec:.3f} spec={spec_query[:30]!r} actual={actual_query[:30]!r}")
+        return sim_vec >= HIT_VECTOR_THRESHOLD
+    # fallback to difflib
     ratio = similarity(spec_query, actual_query)
-    print(f"[EVAL] similarity={ratio:.2f} spec={spec_query[:30]!r} actual={actual_query[:30]!r}")
-    return ratio >= threshold
+    print(f"[EVAL-difflib] sim={ratio:.2f} spec={spec_query[:30]!r} actual={actual_query[:30]!r}")
+    return ratio >= HIT_SIMILARITY_THRESHOLD
 
 
 async def predict_completion(partial: str) -> str:
@@ -194,6 +237,7 @@ class SpecCandidate:
         self.task: asyncio.Task | None = None
         self.result: str | None = None
         self.error: bool = False
+        self.embedding: list[float] | None = None
 
 
 class SpeculativeSession:
@@ -237,10 +281,22 @@ class SpeculativeSession:
     def has_candidate_for(self, query: str) -> bool:
         return any(c.query == query for c in self.spec_candidates)
 
-    def best_candidate(self, actual: str):
+    async def best_candidate(self, actual: str):
         completed = [c for c in self.spec_candidates if c.result is not None]
         if not completed:
             return None
+        actual_emb = await embed(actual)
+        if actual_emb is not None and any(c.embedding for c in completed):
+            scored = []
+            for c in completed:
+                sc = cosine(c.embedding, actual_emb)
+                if sc is None:
+                    sc = similarity(c.query, actual)  # difflib fallback per-candidate
+                scored.append((sc, c))
+            scored.sort(key=lambda x: x[0], reverse=True)
+            print(f"[BEST-vec] picks={[(round(s,3), c.query[:25]) for s,c in scored[:3]]}")
+            return scored[0][1]
+        # full fallback
         return max(completed, key=lambda c: similarity(c.query, actual))
 
     def stats(self) -> dict:
@@ -259,6 +315,11 @@ async def index():
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     session = SpeculativeSession()
+
+    async def _attach_embedding(candidate: SpecCandidate):
+        emb = await embed(candidate.query)
+        if emb is not None:
+            candidate.embedding = emb
 
     async def run_speculation(candidate: SpecCandidate):
         print(f"[SPEC] start: {candidate.query[:40]!r}")
@@ -319,13 +380,19 @@ async def websocket_endpoint(websocket: WebSocket):
                 candidate = SpecCandidate(prediction, list(session.history))
                 session.spec_candidates.append(candidate)
                 candidate.task = asyncio.create_task(run_speculation(candidate))
+                asyncio.create_task(_attach_embedding(candidate))
                 session.stable_count = 0  # next stable round needed for next candidate
         except asyncio.CancelledError:
             pass
         except Exception as e:
             print(f"[PRED] error: {e}")
 
-    async def run_real(actual_query: str, spec_query: str, history: list[dict]):
+    async def run_real(
+        actual_query: str,
+        spec_query: str,
+        spec_emb: list[float] | None,
+        history: list[dict],
+    ):
         print(f"[REAL] start: {actual_query[:40]!r}")
         hit = is_prediction_hit(spec_query, actual_query)
         await websocket.send_json({"type": "real_start", "hit": hit})
@@ -335,6 +402,7 @@ async def websocket_endpoint(websocket: WebSocket):
 
             result = await call_main_llm(actual_query, history, on_chunk=on_chunk)
             print(f"[REAL] done: {len(result)} chars")
+            hit = await is_prediction_hit(spec_query, spec_emb, actual_query)
             await websocket.send_json({
                 "type": "real_end",
                 "hit": hit,
@@ -369,7 +437,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 session.cancel_predict()
                 session.cancel_real()
 
-                best = session.best_candidate(query)
+                best = await session.best_candidate(query)
                 history_snapshot = list(session.history)
                 all_queries = [c.query for c in session.spec_candidates]
                 picked = best.query[:30] if best else None
@@ -389,7 +457,7 @@ async def websocket_endpoint(websocket: WebSocket):
                         "cache_hit": True,
                     })
                     session.add_to_history(query, best.result)
-                    session.real_task = asyncio.create_task(run_real(query, best.query, history_snapshot))
+                    session.real_task = asyncio.create_task(run_real(query, best.query, best.embedding, history_snapshot))
                 else:
                     await websocket.send_json({"type": "thinking"})
                     try:
