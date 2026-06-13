@@ -62,6 +62,7 @@ const statusBar = document.getElementById('status-bar');
 const statusText = document.getElementById('status-text');
 
 let lastAssistantMsg = null; // 直近の投機ヒットメッセージ（切替用）
+let streamingMsg = null;     // cache_miss ストリーミング中の本文要素
 
 function setStatus(state, text) {
   statusBar.className = state;
@@ -136,49 +137,95 @@ ws.onmessage = (e) => {
   } else if (data.type === 'thinking') {
     setStatus('thinking', '生成中…');
     sendBtn.disabled = true;
+  } else if (data.type === 'response_start') {
+    // cache_miss のストリーミング開始: 空メッセージを作る
+    streamingMsg = addMsg('assistant', '');
+  } else if (data.type === 'response_chunk') {
+    if (streamingMsg) {
+      streamingMsg.textContent += data.text;
+      messages.scrollTop = messages.scrollHeight;
+    }
+  } else if (data.type === 'response_end') {
+    streamingMsg = null;
+    setStatus('', '');
+    sendBtn.disabled = false;
+    lastAssistantMsg = null;
   } else if (data.type === 'response') {
+    // 互換: 投機ヒット時の完成品応答（cache_hit=true）
     if (data.cache_hit) {
       lastAssistantMsg = addSpeculativeMsg(data.text, data.speculative_query, data.candidates);
+      lastAssistantMsg.realBuffer = '';
+      lastAssistantMsg.realDone = false;
       setStatus('', '');
-      // 本物の回答生成中なので送信は一時的にOK（本物が来るまで）
-    } else {
-      addMsg('assistant', data.text);
-      setStatus('', '');
-      sendBtn.disabled = false;
-      lastAssistantMsg = null;
     }
-  } else if (data.type === 'real_response') {
+  } else if (data.type === 'real_start') {
     if (lastAssistantMsg) {
-      const { meta, realLoading, specText } = lastAssistantMsg;
-      realLoading.remove();
-
-      if (!data.hit) {
-        // 予測外れ → 切替ボタンを出す
+      lastAssistantMsg.realHit = data.hit;
+      lastAssistantMsg.realLoading.textContent = data.hit
+        ? '本物応答を並行生成中…（予測当たりなので非表示）'
+        : '⚠ 予測外れ: 本物応答を生成中…';
+      // 外れ判定なら早めに切替ボタンを出してストリーミング中も切替可能に
+      if (!data.hit && !lastAssistantMsg.switchBtn) {
+        const meta = lastAssistantMsg.meta;
         const body = lastAssistantMsg.div.querySelector('.msg-body');
-        const realText = data.text;
+        const specText = lastAssistantMsg.specText;
         const switchBtn = document.createElement('button');
         switchBtn.className = 'switch-btn';
-        switchBtn.textContent = '⚠ 予測外れ: 実際の回答を見る';
-
-        let showingSpec = true;
+        switchBtn.textContent = '⚠ 予測外れ: 実際の回答を見る (生成中…)';
+        lastAssistantMsg.showingReal = false;
+        const captured = lastAssistantMsg;
         switchBtn.addEventListener('click', () => {
-          showingSpec = !showingSpec;
-          const canonical = showingSpec ? specText : realText;
+          captured.showingReal = !captured.showingReal;
+          const canonical = captured.showingReal
+            ? (captured.realBuffer || '')
+            : specText;
           body.textContent = canonical;
-          switchBtn.textContent = showingSpec ? '⚠ 予測外れ: 実際の回答を見る' : '↩ 投機回答に戻す';
+          const liveSuffix = captured.realDone ? '' : ' (生成中…)';
+          switchBtn.textContent = captured.showingReal
+            ? `↩ 投機回答に戻す${liveSuffix}`
+            : `⚠ 予測外れ: 実際の回答を見る${liveSuffix}`;
           ws.send(JSON.stringify({ type: 'canon', text: canonical }));
         });
-
+        lastAssistantMsg.switchBtn = switchBtn;
         meta.appendChild(switchBtn);
+      }
+    }
+  } else if (data.type === 'real_chunk') {
+    if (lastAssistantMsg) {
+      lastAssistantMsg.realBuffer = (lastAssistantMsg.realBuffer || '') + data.text;
+      // 既に本物を表示中ならライブ更新
+      if (lastAssistantMsg.showingReal) {
+        const body = lastAssistantMsg.div.querySelector('.msg-body');
+        body.textContent = lastAssistantMsg.realBuffer;
         messages.scrollTop = messages.scrollHeight;
       }
-      // 予測当たり → 何もしない（ボタン出さない）
+    }
+  } else if (data.type === 'real_end') {
+    if (lastAssistantMsg) {
+      lastAssistantMsg.realDone = true;
+      lastAssistantMsg.realBuffer = data.text;
+      const { realLoading, switchBtn, showingReal } = lastAssistantMsg;
+      if (!data.hit) {
+        if (switchBtn) {
+          switchBtn.textContent = showingReal
+            ? '↩ 投機回答に戻す'
+            : '⚠ 予測外れ: 実際の回答を見る';
+        }
+        if (realLoading) realLoading.textContent = '';
+        // ライブ表示中なら最終テキストで上書き
+        if (showingReal) {
+          const body = lastAssistantMsg.div.querySelector('.msg-body');
+          body.textContent = data.text;
+        }
+      } else {
+        if (realLoading) realLoading.remove();
+      }
+      messages.scrollTop = messages.scrollHeight;
       lastAssistantMsg = null;
     }
   } else if (data.type === 'real_error') {
     if (lastAssistantMsg) {
-      const { realLoading } = lastAssistantMsg;
-      realLoading.textContent = ``;
+      lastAssistantMsg.realLoading.textContent = '';
       lastAssistantMsg = null;
     }
   } else if (data.type === 'error') {
