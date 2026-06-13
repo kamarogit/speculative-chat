@@ -77,7 +77,7 @@ function addMsg(role, text) {
   return div;
 }
 
-function addSpeculativeMsg(specText, specQuery) {
+function addSpeculativeMsg(specText, specQuery, candidates) {
   const div = document.createElement('div');
   div.className = 'msg assistant cache-hit';
 
@@ -90,17 +90,27 @@ function addSpeculativeMsg(specText, specQuery) {
 
   const badgeHit = document.createElement('div');
   badgeHit.className = 'badge-hit';
-  badgeHit.textContent = '⚡ 投機実行ヒット';
+  const nCands = (candidates && candidates.length) || 1;
+  badgeHit.textContent = nCands > 1 ? `⚡ 投機実行ヒット (${nCands}候補中ベストマッチ採用)` : '⚡ 投機実行ヒット';
 
   const badgePred = document.createElement('div');
   badgePred.className = 'badge-predicted';
-  badgePred.textContent = `予測プロンプト: "${specQuery}"`;
+  badgePred.textContent = `採用予測: "${specQuery}"`;
 
   const realLoading = document.createElement('div');
   realLoading.className = 'real-loading';
 
   meta.appendChild(badgeHit);
   meta.appendChild(badgePred);
+  if (nCands > 1) {
+    const others = candidates.filter(q => q !== specQuery);
+    if (others.length) {
+      const otherDiv = document.createElement('div');
+      otherDiv.className = 'badge-predicted';
+      otherDiv.textContent = `他候補: ${others.map(q => `"${q}"`).join(', ')}`;
+      meta.appendChild(otherDiv);
+    }
+  }
   meta.appendChild(realLoading);
   div.appendChild(body);
   div.appendChild(meta);
@@ -116,9 +126,11 @@ ws.onmessage = (e) => {
   if (data.type === 'predicting') {
     setStatus('predicting', `プロンプト予測中…`);
   } else if (data.type === 'speculating') {
-    setStatus('speculating', `投機実行中… "${data.query.slice(0, 30)}"`);
+    const c = `(走行${data.running}/完了${data.done})`;
+    setStatus('speculating', `投機実行中 ${c}: "${data.query.slice(0, 30)}"`);
   } else if (data.type === 'speculative_done') {
-    setStatus('hit', '投機実行完了（送信待ち）');
+    const rem = data.running > 0 ? ` ・他${data.running}件走行中` : '';
+    setStatus('hit', `投機実行完了 ${data.done}件待機${rem}`);
   } else if (data.type === 'speculative_error') {
     setStatus('', '');
   } else if (data.type === 'thinking') {
@@ -126,7 +138,7 @@ ws.onmessage = (e) => {
     sendBtn.disabled = true;
   } else if (data.type === 'response') {
     if (data.cache_hit) {
-      lastAssistantMsg = addSpeculativeMsg(data.text, data.speculative_query);
+      lastAssistantMsg = addSpeculativeMsg(data.text, data.speculative_query, data.candidates);
       setStatus('', '');
       // 本物の回答生成中なので送信は一時的にOK（本物が来るまで）
     } else {

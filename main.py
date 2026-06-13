@@ -13,11 +13,23 @@ from fastapi.staticfiles import StaticFiles
 load_dotenv()
 
 PREDICT_MIN_LENGTH = 10
-STABLE_THRESHOLD = 2
+STABLE_THRESHOLD = 1
 PREDICT_DEBOUNCE = 0.4
+MAX_SPEC_CANDIDATES = 4
+HIT_SIMILARITY_THRESHOLD = 0.75
+STABLE_SIMILARITY = 0.50          # 前回予測との類似度がこれ以上ならstable累積
+CANDIDATE_DEDUP_SIMILARITY = 0.92 # 既存候補とこれ以上似てたら新候補化スキップ
 
-OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://192.168.100.106:11434")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3:1.7b")
+MAIN_BACKEND = os.getenv("MAIN_BACKEND", "ollama").lower()  # "ollama" | "openrouter"
+
+MAIN_OLLAMA_BASE_URL = os.getenv("MAIN_OLLAMA_BASE_URL", "http://192.168.100.120:11434")
+MAIN_OLLAMA_MODEL = os.getenv("MAIN_OLLAMA_MODEL", "qwen3.5:27b")
+
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
+OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL") or os.getenv("LLM_MODEL", "anthropic/claude-3.5-haiku")
+
+PREDICT_OLLAMA_BASE_URL = os.getenv("PREDICT_OLLAMA_BASE_URL", "http://192.168.100.113:11434")
+PREDICT_OLLAMA_MODEL = os.getenv("PREDICT_OLLAMA_MODEL", "Qwen3:1.7b")
 
 
 @asynccontextmanager
@@ -29,22 +41,45 @@ app = FastAPI(lifespan=lifespan)
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
 
-async def call_main_llm(query: str, history: list[dict] | None = None) -> str:
-    api_key = os.getenv("OPENROUTER_API_KEY") or os.getenv("ANTHROPIC_API_KEY")
-    if not api_key:
-        return "[ERROR] API key not set in .env"
-    messages = list(history or []) + [{"role": "user", "content": query}]
-    async with httpx.AsyncClient(timeout=60) as client:
+def strip_think(text: str) -> str:
+    if "<think>" in text:
+        text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+    return text
+
+
+async def call_main_llm_ollama(messages: list[dict]) -> str:
+    async with httpx.AsyncClient(timeout=180) as client:
         r = await client.post(
-            "https://openrouter.ai/api/v1/chat/completions",
-            headers={"Authorization": f"Bearer {api_key}"},
+            f"{MAIN_OLLAMA_BASE_URL}/api/chat",
             json={
-                "model": os.getenv("LLM_MODEL", "anthropic/claude-3.5-haiku"),
+                "model": MAIN_OLLAMA_MODEL,
                 "messages": messages,
+                "think": False,
+                "stream": False,
             },
         )
         r.raise_for_status()
+        return strip_think(r.json()["message"]["content"])
+
+
+async def call_main_llm_openrouter(messages: list[dict]) -> str:
+    if not OPENROUTER_API_KEY:
+        return "[ERROR] OPENROUTER_API_KEY not set"
+    async with httpx.AsyncClient(timeout=60) as client:
+        r = await client.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}"},
+            json={"model": OPENROUTER_MODEL, "messages": messages},
+        )
+        r.raise_for_status()
         return r.json()["choices"][0]["message"]["content"]
+
+
+async def call_main_llm(query: str, history: list[dict] | None = None) -> str:
+    messages = list(history or []) + [{"role": "user", "content": query}]
+    if MAIN_BACKEND == "openrouter":
+        return await call_main_llm_openrouter(messages)
+    return await call_main_llm_ollama(messages)
 
 
 PREDICT_SYSTEM = """あなたはユーザーの入力途中の文章を、最も自然な完成形に予測補完するアシスタントです。
@@ -62,8 +97,12 @@ PREDICT_SYSTEM = """あなたはユーザーの入力途中の文章を、最も
 出力: 富士山の標高は何メートルですか？"""
 
 
-def is_prediction_hit(spec_query: str, actual_query: str, threshold: float = 0.75) -> bool:
-    ratio = difflib.SequenceMatcher(None, spec_query, actual_query).ratio()
+def similarity(a: str, b: str) -> float:
+    return difflib.SequenceMatcher(None, a, b).ratio()
+
+
+def is_prediction_hit(spec_query: str, actual_query: str, threshold: float = HIT_SIMILARITY_THRESHOLD) -> bool:
+    ratio = similarity(spec_query, actual_query)
     print(f"[EVAL] similarity={ratio:.2f} spec={spec_query[:30]!r} actual={actual_query[:30]!r}")
     return ratio >= threshold
 
@@ -71,9 +110,9 @@ def is_prediction_hit(spec_query: str, actual_query: str, threshold: float = 0.7
 async def predict_completion(partial: str) -> str:
     async with httpx.AsyncClient(timeout=15) as client:
         r = await client.post(
-            f"{OLLAMA_BASE_URL}/api/chat",
+            f"{PREDICT_OLLAMA_BASE_URL}/api/chat",
             json={
-                "model": OLLAMA_MODEL,
+                "model": PREDICT_OLLAMA_MODEL,
                 "messages": [
                     {"role": "system", "content": PREDICT_SYSTEM},
                     {"role": "user", "content": f"入力: {partial}\n出力:"},
@@ -84,13 +123,20 @@ async def predict_completion(partial: str) -> str:
             },
         )
         r.raise_for_status()
-        content = r.json()["message"]["content"].strip()
-        if "<think>" in content:
-            content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
-        for prefix in ("出力:", "出力：", "完成形:", "完成形："):
+        content = strip_think(r.json()["message"]["content"].strip())
+        for prefix in ("出力:", "出力:", "完成形:", "完成形:"):
             if content.startswith(prefix):
                 content = content[len(prefix):].strip()
         return content
+
+
+class SpecCandidate:
+    def __init__(self, query: str, history: list[dict]):
+        self.query = query
+        self.history = history
+        self.task: asyncio.Task | None = None
+        self.result: str | None = None
+        self.error: bool = False
 
 
 class SpeculativeSession:
@@ -100,9 +146,7 @@ class SpeculativeSession:
         self.predict_task: asyncio.Task | None = None
         self.last_prediction: str = ""
         self.stable_count: int = 0
-        self.speculative_task: asyncio.Task | None = None
-        self.speculative_query: str = ""
-        self.speculative_result: str | None = None
+        self.spec_candidates: list[SpecCandidate] = []
         self.real_task: asyncio.Task | None = None
 
     def add_to_history(self, user: str, assistant: str):
@@ -119,11 +163,11 @@ class SpeculativeSession:
         if self.predict_task and not self.predict_task.done():
             self.predict_task.cancel()
 
-    def cancel_speculation(self):
-        if self.speculative_task and not self.speculative_task.done():
-            self.speculative_task.cancel()
-        self.speculative_result = None
-        self.speculative_query = ""
+    def cancel_all_speculations(self):
+        for c in self.spec_candidates:
+            if c.task and not c.task.done():
+                c.task.cancel()
+        self.spec_candidates = []
 
     def cancel_real(self):
         if self.real_task and not self.real_task.done():
@@ -132,6 +176,20 @@ class SpeculativeSession:
     def reset_prediction(self):
         self.last_prediction = ""
         self.stable_count = 0
+
+    def has_candidate_for(self, query: str) -> bool:
+        return any(c.query == query for c in self.spec_candidates)
+
+    def best_candidate(self, actual: str):
+        completed = [c for c in self.spec_candidates if c.result is not None]
+        if not completed:
+            return None
+        return max(completed, key=lambda c: similarity(c.query, actual))
+
+    def stats(self) -> dict:
+        running = sum(1 for c in self.spec_candidates if c.result is None and not c.error)
+        done = sum(1 for c in self.spec_candidates if c.result is not None)
+        return {"running": running, "done": done, "total": len(self.spec_candidates)}
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -145,50 +203,66 @@ async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     session = SpeculativeSession()
 
-    async def run_speculation(query: str, history: list[dict]):
-        session.speculative_query = query
-        session.speculative_result = None
-        await websocket.send_json({"type": "speculating", "query": query})
-        print(f"[SPEC] start: {query[:40]!r}")
+    async def run_speculation(candidate: SpecCandidate):
+        print(f"[SPEC] start: {candidate.query[:40]!r}")
+        await websocket.send_json({
+            "type": "speculating",
+            "query": candidate.query,
+            **session.stats(),
+        })
         try:
-            result = await call_main_llm(query, history)
-            session.speculative_result = result
-            print(f"[SPEC] done: {len(result)} chars")
-            await websocket.send_json({"type": "speculative_done", "query": query})
+            result = await call_main_llm(candidate.query, candidate.history)
+            candidate.result = result
+            print(f"[SPEC] done ({len(result)} chars): {candidate.query[:30]!r}")
+            await websocket.send_json({
+                "type": "speculative_done",
+                "query": candidate.query,
+                **session.stats(),
+            })
         except asyncio.CancelledError:
-            print("[SPEC] cancelled")
+            print(f"[SPEC] cancelled: {candidate.query[:30]!r}")
         except Exception as e:
             print(f"[SPEC] error: {e}")
-            session.speculative_result = None
+            candidate.error = True
             await websocket.send_json({"type": "speculative_error", "error": str(e)})
 
     async def run_prediction(text: str):
         await asyncio.sleep(PREDICT_DEBOUNCE)
         try:
             prediction = await predict_completion(text)
-            print(f"[PRED] {text[:20]!r} → {prediction[:40]!r}")
+            print(f"[PRED] {text[:20]!r} -> {prediction[:40]!r}")
             if not prediction or len(prediction) < 5:
                 return
-            if prediction == session.last_prediction:
-                session.stable_count += 1
-                print(f"[PRED] stable x{session.stable_count}")
-                if session.stable_count >= STABLE_THRESHOLD:
-                    spec_running = (
-                        session.speculative_task is not None
-                        and not session.speculative_task.done()
-                    )
-                    already_have = (
-                        session.speculative_result is not None
-                        and session.speculative_query == prediction
-                    )
-                    if not spec_running and not already_have:
-                        session.speculative_task = asyncio.create_task(
-                            run_speculation(prediction, list(session.history))
-                        )
+
+            prev = session.last_prediction
+            session.last_prediction = prediction
+            if prev:
+                sim = similarity(prev, prediction)
+                if sim >= STABLE_SIMILARITY:
+                    session.stable_count += 1
+                    print(f"[PRED] stable x{session.stable_count} (sim={sim:.2f})")
+                else:
+                    session.stable_count = 1
+                    print(f"[PRED] reset (sim={sim:.2f} < {STABLE_SIMILARITY})")
             else:
-                session.last_prediction = prediction
                 session.stable_count = 1
-                # 予測が変わっても既存の投機結果は捨てない
+
+            if session.stable_count >= STABLE_THRESHOLD:
+                dup = next(
+                    (c for c in session.spec_candidates
+                     if similarity(prediction, c.query) >= CANDIDATE_DEDUP_SIMILARITY),
+                    None,
+                )
+                if dup is not None:
+                    print(f"[SPEC] skip dedup: similar to {dup.query[:30]!r}")
+                    return
+                if len(session.spec_candidates) >= MAX_SPEC_CANDIDATES:
+                    print(f"[SPEC] skip: max {MAX_SPEC_CANDIDATES} candidates reached")
+                    return
+                candidate = SpecCandidate(prediction, list(session.history))
+                session.spec_candidates.append(candidate)
+                candidate.task = asyncio.create_task(run_speculation(candidate))
+                session.stable_count = 0  # next stable round needed for next candidate
         except asyncio.CancelledError:
             pass
         except Exception as e:
@@ -224,7 +298,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     session.predict_task = asyncio.create_task(run_prediction(session.current_input))
                 else:
                     session.reset_prediction()
-                    session.cancel_speculation()
+                    session.cancel_all_speculations()
 
             elif event == "submit":
                 query = data["text"].strip()
@@ -234,23 +308,28 @@ async def websocket_endpoint(websocket: WebSocket):
                 session.cancel_predict()
                 session.cancel_real()
 
-                spec_result = session.speculative_result
-                spec_query = session.speculative_query
+                best = session.best_candidate(query)
                 history_snapshot = list(session.history)
+                all_queries = [c.query for c in session.spec_candidates]
+                picked = best.query[:30] if best else None
+                print(f"[SUBMIT] {len(session.spec_candidates)} candidates -> picked: {picked!r}")
 
-                if spec_result is not None:
+                # cancel still-running speculations
+                for c in session.spec_candidates:
+                    if c.task and not c.task.done():
+                        c.task.cancel()
+
+                if best is not None:
                     await websocket.send_json({
                         "type": "response",
-                        "text": spec_result,
-                        "speculative_query": spec_query,
+                        "text": best.result,
+                        "speculative_query": best.query,
+                        "candidates": all_queries,
                         "cache_hit": True,
                     })
-                    # 投機結果を履歴に追加（ユーザーが最初に見るのがこちら）
-                    session.add_to_history(query, spec_result)
-                    # 本物のプロンプトでも並行実行（履歴には入れない・比較用）
-                    session.real_task = asyncio.create_task(run_real(query, spec_query, history_snapshot))
+                    session.add_to_history(query, best.result)
+                    session.real_task = asyncio.create_task(run_real(query, best.query, history_snapshot))
                 else:
-                    session.cancel_speculation()
                     await websocket.send_json({"type": "thinking"})
                     try:
                         result = await call_main_llm(query, session.history)
@@ -264,8 +343,7 @@ async def websocket_endpoint(websocket: WebSocket):
                         await websocket.send_json({"type": "error", "error": str(e)})
 
                 session.reset_prediction()
-                session.speculative_result = None
-                session.speculative_query = ""
+                session.spec_candidates = []
 
             elif event == "canon":
                 session.swap_last_assistant(data["text"])
@@ -273,11 +351,11 @@ async def websocket_endpoint(websocket: WebSocket):
 
             elif event == "clear":
                 session.cancel_predict()
-                session.cancel_speculation()
+                session.cancel_all_speculations()
                 session.reset_prediction()
                 session.current_input = ""
 
     except WebSocketDisconnect:
         session.cancel_predict()
-        session.cancel_speculation()
+        session.cancel_all_speculations()
         session.cancel_real()
